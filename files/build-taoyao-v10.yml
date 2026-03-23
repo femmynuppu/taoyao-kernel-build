@@ -1,0 +1,512 @@
+name: Build Kernel - Xiaomi 12 Lite (taoyao) [ReSukiSU]
+
+on:
+  workflow_dispatch:
+    inputs:
+      SUKISU_BRANCH:
+        description: 'ReSukiSU branch (builtin/susfs-main)'
+        required: true
+        default: 'builtin'
+      ENABLE_KPM:
+        description: 'Enable KPM support'
+        type: boolean
+        default: true
+      ENABLE_SUSFS:
+        description: 'Enable SUSFS v2.1'
+        type: boolean
+        default: true
+      ENABLE_BBR:
+        description: 'Enable TCP BBR/BBR2'
+        type: boolean
+        default: true
+      ENABLE_ZRAM:
+        description: 'Enable ZRAM optimization'
+        type: boolean
+        default: true
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  KERNEL_SOURCE: 'https://github.com/richardqcarvalho/kernel_xiaomi_taoyao'
+  KERNEL_BRANCH: 'bka'
+  KERNEL_DIR: 'kernel_source'
+  OUT_DIR: 'out'
+
+jobs:
+  build:
+    name: Build taoyao kernel
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git bc bison flex libssl-dev make libelf-dev \
+            libc6-dev binutils-aarch64-linux-gnu \
+            python3 python3-pip zip curl wget \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            cpio kmod pahole pkg-config \
+            clang lld llvm
+
+      - name: Cache Proton Clang
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains/clang
+          key: proton-clang-20210522-v3
+
+      - name: Download Proton Clang
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/toolchains/clang
+          git clone --depth=1 \
+            https://github.com/kdrag0n/proton-clang \
+            ~/toolchains/clang
+
+      - name: Export toolchain path
+        run: |
+          echo "$HOME/toolchains/clang/bin" >> $GITHUB_PATH
+          echo "CLANG_PATH=$HOME/toolchains/clang/bin" >> $GITHUB_ENV
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 \
+            --branch ${{ env.KERNEL_BRANCH }} \
+            --no-recurse-submodules \
+            ${{ env.KERNEL_SOURCE }} \
+            ${{ env.KERNEL_DIR }}
+          cd ${{ env.KERNEL_DIR }}
+          echo "HEAD: $(git log --oneline -1)"
+
+      - name: Remove KernelSU-Next submodule
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          # Remove upstream KSU-Next submodule so we can replace with ReSukiSU
+          if [ -f ".gitmodules" ] && grep -q "KernelSU" .gitmodules; then
+            git submodule deinit -f -- KernelSU-Next 2>/dev/null || true
+            git rm --cached KernelSU-Next 2>/dev/null || true
+            rm -rf KernelSU-Next .git/modules/KernelSU-Next
+            echo "KernelSU-Next submodule removed"
+          fi
+          # Rename any KernelSU-Next references in Makefiles to KernelSU
+          find . -name "Makefile" -o -name "Kbuild" | xargs grep -l "KernelSU-Next" 2>/dev/null | while read f; do
+            sed -i 's|KernelSU-Next|KernelSU|g' "$f"
+            echo "Patched: $f"
+          done
+
+      - name: Integrate ReSukiSU
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" \
+            | bash -s ${{ github.event.inputs.SUKISU_BRANCH }}
+          echo "ReSukiSU integrated: ${{ github.event.inputs.SUKISU_BRANCH }}"
+
+      - name: Patch TP hooks for non-GKI kernel
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          # TP (tracepoint) hooks only work on GKI 2.0 (5.10+).
+          # Kernel 5.4 QGKI must use manual hooks — disable TP hook enforcement.
+          KBUILD="drivers/kernelsu/Kbuild"
+          if [ -f "$KBUILD" ]; then
+            # Remove the $(error ...) line that halts non-GKI builds
+            sed -i '/TP hooks are incompatible/d' "$KBUILD"
+            sed -i '/\$(error.*Non-GKI/d' "$KBUILD"
+            # Broader catch: delete any $(error ...) line inside KPM/TP hook section
+            sed -i '/^\$(error/d' "$KBUILD"
+            echo "TP hook enforcement removed from Kbuild"
+          fi
+
+      - name: Integrate SUSFS
+        if: ${{ github.event.inputs.ENABLE_SUSFS == 'true' }}
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          SUSFS_REPO="/tmp/susfs4ksu"
+          git clone --depth=1 \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            -b kernel-5.4 \
+            "$SUSFS_REPO"
+
+          # Copy kernel-space SUSFS source
+          echo "▶ Copying susfs.c → fs/"
+          cp "$SUSFS_REPO/kernel_patches/fs/susfs.c" fs/
+
+          echo "▶ Copying headers → include/linux/"
+          cp "$SUSFS_REPO/kernel_patches/include/linux/susfs.h" include/linux/
+
+          # susfs_def.h — copy if present, otherwise create proper stub
+          # susfs_def.h — copy if present, otherwise download it from gitlab
+          if [ -f "$SUSFS_REPO/kernel_patches/include/linux/susfs_def.h" ]; then
+            cp "$SUSFS_REPO/kernel_patches/include/linux/susfs_def.h" include/linux/
+            echo "susfs_def.h copied from local repo clone"
+          else
+            echo "susfs_def.h missing from local clone, downloading directly..."
+            curl -LSs "https://gitlab.com/simonpunk/susfs4ksu/-/raw/kernel-5.4/kernel_patches/include/linux/susfs_def.h" -o include/linux/susfs_def.h
+          fi
+
+          # Apply main kernel patch
+          echo "▶ Applying 50_add_susfs_in_kernel-5.4.patch"
+          patch -p1 --fuzz=3 --forward \
+            < "$SUSFS_REPO/kernel_patches/50_add_susfs_in_kernel-5.4.patch" \
+            || echo "WARNING: Some hunks failed — manual review needed but continuing"
+
+          echo "SUSFS integration complete"
+
+      - name: Apply source patches
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          # ─── Fix: Stub missing SUSFS v1.5.2 APIs for older 5.4 SUSFS ───
+          if [ -f "include/linux/susfs.h" ]; then
+            echo "▶ Patching include/linux/susfs.h to include susfs_def.h and newer API stubs..."
+            echo '
+            #include <linux/susfs_def.h>
+            
+            #ifndef SUSFS_MAGIC
+            #define SUSFS_MAGIC 0xFAFAFAFA
+            #endif
+            
+            #ifndef CMD_SUSFS_ADD_SUS_PATH_LOOP
+            #define CMD_SUSFS_ADD_SUS_PATH_LOOP 0x55551
+            static inline void susfs_add_sus_path_loop(void __user *a) {}
+            #endif
+            
+            #ifndef CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS
+            #define CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x55561
+            static inline void susfs_set_hide_sus_mnts_for_non_su_procs(void __user *a) {}
+            #endif
+            
+            #ifndef CMD_SUSFS_ADD_SUS_MAP
+            #define CMD_SUSFS_ADD_SUS_MAP 0x55573
+            static inline void susfs_add_sus_map(void __user *a) {}
+            #endif
+            
+            #ifndef CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING
+            #define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING 0x555a1
+            static inline void susfs_set_avc_log_spoofing(void __user *a) {}
+            #endif
+            
+            #ifndef CMD_SUSFS_SHOW_ENABLED_FEATURES
+            #define CMD_SUSFS_SHOW_ENABLED_FEATURES 0x555e2
+            static inline void susfs_get_enabled_features(void __user *a) {}
+            #endif
+            
+            #ifndef CMD_SUSFS_SHOW_VARIANT
+            #define CMD_SUSFS_SHOW_VARIANT 0x555e3
+            static inline void susfs_show_variant(void __user *a) {}
+            #endif
+            
+            #ifndef CMD_SUSFS_SHOW_VERSION
+            #define CMD_SUSFS_SHOW_VERSION 0x555e1
+            static inline void susfs_show_version(void __user *a) {}
+            #endif
+            ' >> include/linux/susfs.h
+          fi
+
+          # ─── Fix 2: ReSukiSU supercalls.c SUSFS pointer mismatch ───
+          # ReSukiSU susfs-ksud branch mistakenly passes `arg` (which is void **) 
+          # instead of `*arg` to the susfs functions, causing incompatible pointer errors.
+          if [ -f "drivers/kernelsu/supercalls.c" ]; then
+            perl -i -pe 's/susfs_([a-z_]+)\(arg\)/susfs_$1((void __user *)(*arg))/g' drivers/kernelsu/supercalls.c
+            echo "Patched supercalls.c SUSFS pointer casts"
+          fi
+
+          # ─── Fix 1: qcom_scm.h — void functions incorrectly get return value ───
+          # Root cause: previous perl fix matched void functions too.
+          # Correct approach: ONLY add return 0 to functions with explicit non-void
+          # return types. Use explicit type list, not negative lookahead.
+          #
+          # Step A: Remove incorrect "return 0" from void functions first
+          perl -i -pe '
+            # Pattern: void function stub that has "return 0" added incorrectly
+            # Match: } { return 0; } at end of line where function is void
+            if (/^static\s+inline\s+void\s+\w+[^{]+\)\s*\{\s*return\s+0;\s*\}/) {
+              s/\{\s*return\s+0;\s*\}/\{ \}/
+            }
+            # Also fix "return false" in void functions
+            if (/^static\s+inline\s+void\s+\w+[^{]+\)\s*\{\s*return\s+false;\s*\}/) {
+              s/\{\s*return\s+false;\s*\}/\{ \}/
+            }
+          ' include/linux/qcom_scm.h
+
+          # Step B: Add return value ONLY to known non-void types (single-line stubs)
+          # Explicit type matching — no lookahead tricks
+          perl -i -pe '
+            # phys_addr_t, dma_addr_t, resource_size_t → return 0
+            if (/^static\s+inline\s+(phys_addr_t|dma_addr_t|resource_size_t)\s+\w+[^{]+\)\s*\{\}$/) {
+              s/\{\}$/\{ return 0; \}/
+            }
+            # int, long, u32, u64, s32, s64 → return 0
+            if (/^static\s+inline\s+(int|long|u32|u64|s32|s64|unsigned\s+int)\s+\w+[^{]+\)\s*\{\}$/) {
+              s/\{\}$/\{ return 0; \}/
+            }
+            # bool → return false
+            if (/^static\s+inline\s+bool\s+\w+[^{]+\)\s*\{\}$/) {
+              s/\{\}$/\{ return false; \}/
+            }
+          ' include/linux/qcom_scm.h
+
+          # ─── Fix 3: WLAN driver icnss2 compilation errors ───
+          if [ -f "drivers/soc/qcom/icnss2/qmi.h" ]; then
+            echo "Patching icnss2/qmi.h to fix compilation errors..."
+            # Remove the conflicting definition that lacks static inline
+            perl -i -0777 -pe 's/int wlfw_wlan_mode_send_sync_msg\(struct icnss_priv \*priv,\s*enum wlfw_driver_mode_enum_v01 mode\)\s*\{\s*return 0;\s*\}//sg' drivers/soc/qcom/icnss2/qmi.h
+            # Fix typo
+            sed -i 's/struct icns_priv/struct icnss_priv/g' drivers/soc/qcom/icnss2/qmi.h
+            # Add missing QDSS stubs when CONFIG_ICNSS2_QMI is disabled
+            cat << 'EOF' >> drivers/soc/qcom/icnss2/qmi.h
+
+#ifndef CONFIG_ICNSS2_QMI
+static inline int icnss_wlfw_qdss_dnld_send_sync(struct icnss_priv *priv) { return 0; }
+static inline int icnss_wlfw_qdss_data_send_sync(struct icnss_priv *priv, char *file_name, u32 total_size) { return 0; }
+static inline int wlfw_qdss_trace_start(struct icnss_priv *priv) { return 0; }
+static inline int wlfw_qdss_trace_stop(struct icnss_priv *priv, unsigned long long option) { return 0; }
+#endif
+EOF
+          fi
+
+
+          # Step C: Fix MULTI-LINE non-void function stubs
+          # Some stubs span multiple lines — return type on line N, ") {}" on line N+1.
+          # The single-line regex above misses these. Use perl slurp mode (-0777).
+          perl -0777 -i -pe '
+            # Match multi-line: static inline <non-void-type> func(...\n...) {}
+            # Replace {} with { return 0; } for numeric types
+            s/(static\s+inline\s+(?:int|long|u32|u64|s32|s64|unsigned\s+int|phys_addr_t|dma_addr_t|resource_size_t)\s+\w+\s*\([^)]*\))\s*\{\}/$1 \{ return 0; \}/g;
+            # Replace {} with { return false; } for bool
+            s/(static\s+inline\s+bool\s+\w+\s*\([^)]*\))\s*\{\}/$1 \{ return false; \}/g;
+          ' include/linux/qcom_scm.h
+
+          echo "✓ qcom_scm.h patched (void-safe, multi-line aware)"
+
+          # ─── Fix 2: coresight usb_qdss_alloc_req arity fix ───
+          # Header has 3-arg version but call site uses 2 args
+          if [ -f "drivers/hwtracing/coresight/coresight-byte-cntr.c" ]; then
+            sed -i 's/usb_qdss_alloc_req(ch, USB_BUF_NUM)/usb_qdss_alloc_req(ch, USB_BUF_NUM, 0)/g' \
+              drivers/hwtracing/coresight/coresight-byte-cntr.c
+            echo "✓ coresight usb_qdss_alloc_req arity fixed"
+          fi
+
+          # ─── Fix 3: rpmb-mtk.c undeclared mtk_mmc_host ───
+          if [ -f "drivers/char/rpmb/rpmb-mtk.c" ]; then
+            sed -i 's/struct mmc_host \*mmc = mtk_mmc_host\[0\]/struct mmc_host *mmc = NULL/g' \
+              drivers/char/rpmb/rpmb-mtk.c
+            echo "✓ rpmb-mtk.c mtk_mmc_host fixed"
+          fi
+
+          echo "All source patches applied"
+
+      - name: Debug - list defconfigs
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          echo "▶ Listing arch/arm64/configs/vendor/:"
+          ls arch/arm64/configs/vendor/ 2>/dev/null || echo "(vendor dir not found)"
+          echo "▶ Listing arch/arm64/configs/:"
+          ls arch/arm64/configs/
+
+      - name: Generate defconfig
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          mkdir -p ${{ env.OUT_DIR }}
+
+          export PATH="$HOME/toolchains/clang/bin:$PATH"
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump
+          export STRIP=llvm-strip
+
+          MAKE="make O=${{ env.OUT_DIR }} ARCH=arm64 CC=clang \
+            AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
+            STRIP=llvm-strip OBJDUMP=llvm-objdump \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu-"
+
+          # QGKI 5.4 uses fragment-based defconfig:
+          # 1. Load GKI base
+          $MAKE gki_defconfig
+          # 2. Merge lahaina SoC fragment (SM7325)
+          $MAKE MERGE_CONFIG=scripts/kconfig/merge_config.sh \
+            vendor/lahaina_QGKI.config 2>/dev/null || \
+            ./scripts/kconfig/merge_config.sh \
+              -O ${{ env.OUT_DIR }} \
+              ${{ env.OUT_DIR }}/.config \
+              arch/arm64/configs/vendor/lahaina_QGKI.config
+          # 3. Merge taoyao device fragment
+          if [ -f "arch/arm64/configs/vendor/taoyao_QGKI.config" ]; then
+            ./scripts/kconfig/merge_config.sh \
+              -O ${{ env.OUT_DIR }} \
+              ${{ env.OUT_DIR }}/.config \
+              arch/arm64/configs/vendor/taoyao_QGKI.config
+            echo "✓ taoyao_QGKI.config merged"
+          fi
+          # 4. Resolve unset symbols
+          $MAKE olddefconfig
+
+      - name: Append custom config
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          CFG="${{ env.OUT_DIR }}/.config"
+
+          # ── ReSukiSU / KSU ──
+          echo "CONFIG_KSU=y" >> "$CFG"
+          echo "CONFIG_KSU_WITH_KPROBES=n" >> "$CFG"
+          echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$CFG"
+
+          # ── KPM ──
+          if [ "${{ github.event.inputs.ENABLE_KPM }}" = "true" ]; then
+            echo "CONFIG_KPM=y" >> "$CFG"
+            echo "CONFIG_MODULES=y" >> "$CFG"
+            echo "CONFIG_MODULE_UNLOAD=y" >> "$CFG"
+            echo "CONFIG_MODULE_FORCE_UNLOAD=y" >> "$CFG"
+            echo "CONFIG_MODVERSIONS=n" >> "$CFG"
+            echo "CONFIG_MODULE_SIG=n" >> "$CFG"
+            echo "CONFIG_MODULE_SIG_FORCE=n" >> "$CFG"
+            echo "CONFIG_KSU_TP_HOOKS=n" >> "$CFG"
+            echo "KPM: enabled"
+          fi
+
+          # ── SUSFS ──
+          if [ "${{ github.event.inputs.ENABLE_SUSFS }}" = "true" ]; then
+            echo "CONFIG_KSU_SUSFS=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SPOOF_BOOTCONFIG=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "$CFG"
+            echo "SUSFS: enabled"
+          fi
+
+          # ── TCP BBR ──
+          if [ "${{ github.event.inputs.ENABLE_BBR }}" = "true" ]; then
+            echo "CONFIG_TCP_CONG_ADVANCED=y" >> "$CFG"
+            echo "CONFIG_TCP_CONG_BBR=y" >> "$CFG"
+            echo 'CONFIG_DEFAULT_TCP_CONG="bbr"' >> "$CFG"
+            echo "BBR: enabled"
+          fi
+
+          # ── ZRAM ──
+          if [ "${{ github.event.inputs.ENABLE_ZRAM }}" = "true" ]; then
+            echo "CONFIG_ZRAM=y" >> "$CFG"
+            echo "CONFIG_ZRAM_DEF_COMP_LZORLE=y" >> "$CFG"
+            echo "CONFIG_CRYPTO_LZO=y" >> "$CFG"
+            echo "CONFIG_CRYPTO_LZ4=y" >> "$CFG"
+            echo "CONFIG_CRYPTO_ZSTD=y" >> "$CFG"
+            echo "CONFIG_ZRAM_WRITEBACK=y" >> "$CFG"
+            echo "ZRAM: enabled"
+          fi
+
+          make O=${{ env.OUT_DIR }} ARCH=arm64 CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig
+
+      - name: Build kernel
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -o pipefail
+          export PATH="$HOME/toolchains/clang/bin:$PATH"
+          BUILD_START=$(date +%s)
+
+          make -j$(nproc) \
+            O=${{ env.OUT_DIR }} \
+            ARCH=arm64 \
+            CC=clang \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            STRIP=llvm-strip \
+            OBJDUMP=llvm-objdump \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            2>&1 | tee build.log
+
+          BUILD_END=$(date +%s)
+          echo "Build time: $((BUILD_END - BUILD_START))s"
+
+      - name: Check build output
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          echo "=== out/arch/arm64/boot/ contents ==="
+          ls -lh ${{ env.OUT_DIR }}/arch/arm64/boot/ || echo "(empty)"
+
+          for img in Image Image.gz Image.gz-dtb Image-dtb Image.lz4; do
+            if [ -f "${{ env.OUT_DIR }}/arch/arm64/boot/$img" ]; then
+              echo "✅ Found: $img"
+              echo "KERNEL_IMAGE=${{ env.OUT_DIR }}/arch/arm64/boot/$img" >> $GITHUB_ENV
+              break
+            fi
+          done
+
+          if [ -z "$KERNEL_IMAGE" ] && [ -z "$(cat $GITHUB_ENV | grep KERNEL_IMAGE)" ]; then
+            echo "❌ Build FAILED — no kernel image found"
+            echo "=== last 80 lines of build.log ==="
+            tail -80 build.log
+            exit 1
+          fi
+
+      - name: Package with AnyKernel3
+        if: success()
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          KIMG=$(cat $GITHUB_ENV | grep KERNEL_IMAGE | cut -d= -f2)
+          cp kernel_source/$KIMG AnyKernel3/
+
+          # Device: taoyao (Xiaomi 12 Lite)
+          cat > AnyKernel3/anykernel.sh << 'AKEOF'
+          properties() { '
+          kernel.string=ReSukiSU + SUSFS + KPM | taoyao | feemi2
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=taoyao
+          device.name2=2203129G
+          supported.versions=13-14
+          '; }
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          AKEOF
+
+          ZIPNAME="ReSukiSU_taoyao_$(date +%Y%m%d_%H%M).zip"
+          cd AnyKernel3
+          zip -r9 "../$ZIPNAME" . -x ".git*" -x "*.placeholder"
+          echo "ZIPNAME=$ZIPNAME" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ReSukiSU_taoyao
+          path: |
+            ${{ env.ZIPNAME }}
+            kernel_source/build.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload build log on failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-log-failure
+          path: kernel_source/build.log
+          retention-days: 3
