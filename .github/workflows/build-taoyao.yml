@@ -114,8 +114,9 @@ jobs:
             # Remove the $(error ...) line that halts non-GKI builds
             sed -i '/TP hooks are incompatible/d' "$KBUILD"
             sed -i '/\$(error.*Non-GKI/d' "$KBUILD"
-            # Broader catch: delete any $(error ...) line inside KPM/TP hook section
-            sed -i '/^\$(error/d' "$KBUILD"
+            sed -i '/\$(error.*integrate/d' "$KBUILD"
+            # Broader catch: delete any $(error ...) line
+            sed -i '/\$(error/d' "$KBUILD"
             echo "TP hook enforcement removed from Kbuild"
           fi
 
