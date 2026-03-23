@@ -492,8 +492,12 @@ jobs:
         if: success()
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
-          KIMG=$(cat $GITHUB_ENV | grep KERNEL_IMAGE | cut -d= -f2)
-          cp kernel_source/$KIMG AnyKernel3/
+          if [ -n "$KERNEL_IMAGE" ]; then
+            cp "kernel_source/$KERNEL_IMAGE" AnyKernel3/
+          else
+            echo "Fallback grabbing any Image"
+            cp kernel_source/out/arch/arm64/boot/Image* AnyKernel3/ || true
+          fi
 
           # Device: taoyao (Xiaomi 12 Lite)
           echo "properties() { '" > AnyKernel3/anykernel.sh
