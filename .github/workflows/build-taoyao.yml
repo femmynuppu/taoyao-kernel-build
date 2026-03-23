@@ -1,6 +1,9 @@
 name: Build Kernel - Xiaomi 12 Lite (taoyao) [ReSukiSU]
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       SUKISU_BRANCH:
