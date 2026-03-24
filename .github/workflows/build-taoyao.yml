@@ -502,13 +502,15 @@ jobs:
           # Device: taoyao (Xiaomi 12 Lite)
           echo "properties() { '" > AnyKernel3/anykernel.sh
           echo "kernel.string=ReSukiSU + SUSFS | taoyao | feemi2" >> AnyKernel3/anykernel.sh
-          echo "do.devicecheck=1" >> AnyKernel3/anykernel.sh
+          echo "do.devicecheck=0" >> AnyKernel3/anykernel.sh
           echo "do.modules=0" >> AnyKernel3/anykernel.sh
           echo "do.systemless=1" >> AnyKernel3/anykernel.sh
           echo "do.cleanup=1" >> AnyKernel3/anykernel.sh
           echo "do.cleanuponabort=0" >> AnyKernel3/anykernel.sh
           echo "device.name1=taoyao" >> AnyKernel3/anykernel.sh
           echo "device.name2=2203129G" >> AnyKernel3/anykernel.sh
+          echo "device.name3=lahaina" >> AnyKernel3/anykernel.sh
+          echo "device.name4=yupik" >> AnyKernel3/anykernel.sh
           echo "supported.versions=13-14" >> AnyKernel3/anykernel.sh
           echo "'; }" >> AnyKernel3/anykernel.sh
           echo "block=/dev/block/bootdevice/by-name/boot;" >> AnyKernel3/anykernel.sh
